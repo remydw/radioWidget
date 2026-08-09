@@ -16,9 +16,22 @@ PluginComponent {
     // as DMS's own SettingsData): ~/.config/DankMaterialShell/...
     readonly property string settingsPath: Paths.strip(StandardPaths.writableLocation(StandardPaths.ConfigLocation)) + "/DankMaterialShell/plugin_settings.json"
 
-    // ---- Live state -----------------------------------------------------
-    // DMS never re-parses backend writes into its in-memory pluginData, so
-    // read the settings file directly and react to backend syncs live.
+    // ---- Station config ---------------------------------------------------
+    readonly property var stations: {
+        "rtl2": {
+            "name": "RTL2",
+            "logo": "https://static.rtl2.fr/versions/www/7.0.413/img/radios/rtl2.png",
+            "fallbackLogo": "https://www.rtl2.fr/apple-touch-icon.png"
+        },
+        "dance895": {
+            "name": "Dance 89.5",
+            "logo": "https://www.dance895.org/wp-content/uploads/2024/08/logo.svg",
+            "fallbackLogo": "https://www.dance895.org/wp-content/uploads/2024/08/cropped-DANCE895_SiteIcon-1-270x270.png"
+        }
+    }
+    readonly property var stationIds: ["rtl2", "dance895"]
+
+    // ---- Live state -------------------------------------------------------
     FileView {
         id: stateFile
         path: root.settingsPath
@@ -38,23 +51,20 @@ PluginComponent {
             const w = (parsed && parsed.rtl2RadioWidget) ? parsed.rtl2RadioWidget : {}
             root.widgetState = w
         } catch (e) {
-            console.error("[RTL2] state parse failed:", e.message)
+            console.error("[RADIO] state parse failed:", e.message)
         }
     }
 
-    property string title: (widgetState.title && widgetState.title.length > 0) ? widgetState.title : "RTL2"
+    property string station: (widgetState.station && widgetState.station.length > 0) ? widgetState.station : "rtl2"
+    property var stationInfo: root.stations[root.station] || root.stations["rtl2"]
+    property string title: (widgetState.title && widgetState.title.length > 0) ? widgetState.title : root.stationInfo.name
     property bool isPlaying: widgetState.isPlaying === true
     property string artist: widgetState.artist || ""
     property string artUrl: widgetState.artUrl || ""
     property int volume: widgetState.volume !== undefined ? widgetState.volume : 100
-    // Official RTL2 station logo (from the site's JSON-LD); apple-touch-icon
-    // as fallback if the versioned path ever moves.
-    property string rtl2LogoUrl: "https://static.rtl2.fr/versions/www/7.0.413/img/radios/rtl2.png"
+    property string stationLogoUrl: root.stationInfo.logo
 
-    // ---- Pill volume wheel ----------------------------------------------
-    // The pill shows only the play/pause state + "RTL2"; hovering it and
-    // scrolling the wheel adjusts volume (shared with the popout slider via
-    // the settings file). The pill briefly shows the percentage as feedback.
+    // ---- Pill volume wheel -------------------------------------------------
     property int volDisplay: -1
 
     Timer {
@@ -73,12 +83,7 @@ PluginComponent {
         }
     }
 
-    // ---- Toggle / settings writes --------------------------------------
-    // pluginService is NOT reliably injected into bar widget instances
-    // (observed NULL in the live bar even after load), so widget writes go
-    // straight into plugin_settings.json — the same file the backend's 1s
-    // poll reads. This is the exact contract that is proven end-to-end,
-    // and it needs no DMS plugin API at all.
+    // ---- Toggle / settings writes -----------------------------------------
     function writeWidgetField(key, value) {
         try {
             const parsed = JSON.parse(stateFile.text() || "{}")
@@ -87,22 +92,18 @@ PluginComponent {
             parsed.rtl2RadioWidget = w
             stateFile.setText(JSON.stringify(parsed, null, 2))
         } catch (e) {
-            console.error("[RTL2] write " + key + " failed:", e.message)
+            console.error("[RADIO] write " + key + " failed:", e.message)
         }
     }
 
     Connections {
         target: root
         function onToggleRequested() {
-            // Unique value per click: the backend treats each "toggle:"
-            // action as a fresh request and clears it after processing.
             root.writeWidgetField("action", "toggle:" + Date.now())
         }
     }
 
-    // Pill: play/pause icon + "RTL2" (detail lives in the media tab and the
-    // hover popout). Hover the pill and scroll the wheel for volume; the
-    // percentage shows briefly in place of "RTL2".
+    // ---- Pill: play/pause icon + station name ------------------------------
     horizontalBarPill: Item {
         implicitWidth: hIcon.implicitWidth + hText.implicitWidth + Theme.spacingS * 3
         implicitHeight: Theme.iconSize + 8
@@ -128,7 +129,7 @@ PluginComponent {
 
         StyledText {
             id: hText
-            text: root.volDisplay >= 0 ? root.volDisplay + "%" : "RTL2"
+            text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
             color: Theme.surfaceText
             font.pixelSize: Theme.fontSizeSmall
             elide: Text.ElideRight
@@ -166,7 +167,7 @@ PluginComponent {
 
         StyledText {
             id: vText
-            text: root.volDisplay >= 0 ? root.volDisplay + "%" : "RTL2"
+            text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
             color: Theme.surfaceText
             font.pixelSize: Theme.fontSizeSmall
             elide: Text.ElideRight
@@ -178,20 +179,17 @@ PluginComponent {
     }
 
     popoutWidth: 380
-    popoutHeight: 260
+    popoutHeight: 320
 
-    // Content must contribute to PopoutComponent's (a Column) implicitHeight
-    // — anchor-positioned children are excluded from Column layout, so the
-    // popup would collapse to just the header. Plain children + explicit
-    // heights keep the hover/click popout fully sized (art, title, artist).
+    // ---- Popout content ---------------------------------------------------
     popoutContent: Component {
         PopoutComponent {
             id: popout
-            headerText: "RTL2"
+            headerText: root.stationInfo.name
             spacing: Theme.spacingS
             property var closePopout: root.closePopout
 
-            // Album art — track art while playing, the RTL2 logo when paused
+            // Album art — track art while playing, station logo when paused
             Item {
                 width: parent.width
                 height: 170
@@ -199,13 +197,13 @@ PluginComponent {
                     anchors.centerIn: parent
                     width: 150
                     height: 150
-                    source: root.isPlaying ? root.artUrl : root.rtl2LogoUrl
+                    source: root.isPlaying ? root.artUrl : root.stationLogoUrl
                     fillMode: Image.PreserveAspectFit
                     asynchronous: true
                     visible: root.isPlaying ? root.artUrl.length > 0 : true
                     onStatusChanged: {
-                        if (status === Image.Error && source === root.rtl2LogoUrl)
-                            root.rtl2LogoUrl = "https://www.rtl2.fr/apple-touch-icon.png"
+                        if (status === Image.Error && source === root.stationLogoUrl)
+                            root.stationLogoUrl = root.stationInfo.fallbackLogo
                     }
                 }
                 DankIcon {
@@ -239,9 +237,49 @@ PluginComponent {
                 visible: root.artist.length > 0
             }
 
-            // Volume: drag the slider or use the mouse wheel
-            // (DankSlider wheelEnabled). Writes are debounced during drags
-            // and flushed on release; the backend's 1s poll applies them.
+            // ---- Station selector ------------------------------------------
+            Item {
+                width: parent.width
+                height: 28
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.spacingS
+                    Repeater {
+                        model: root.stationIds
+                        delegate: Rectangle {
+                            id: stationBtn
+                            required property string modelData
+                            readonly property bool isActive: root.station === modelData
+                            implicitWidth: stationLabel.implicitWidth + Theme.spacingS * 3
+                            height: 26
+                            radius: 4
+                            color: isActive ? Theme.primary : Theme.surfaceVariant
+                            border.width: isActive ? 0 : 1
+                            border.color: Theme.surfaceVariantText
+
+                            StyledText {
+                                id: stationLabel
+                                text: root.stations[stationBtn.modelData].name
+                                color: isActive ? Theme.onPrimary : Theme.surfaceText
+                                font.pixelSize: Theme.fontSizeSmall
+                                anchors.centerIn: parent
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (stationBtn.modelData !== root.station) {
+                                        root.writeWidgetField("station", stationBtn.modelData)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Volume slider
             Row {
                 width: parent.width
                 spacing: Theme.spacingS
