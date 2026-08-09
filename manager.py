@@ -209,7 +209,10 @@ def start_mpv():
             # ahead (2MiB stream buffer at 128kbps), so the audio trails the
             # live broadcast — and the scraped metadata — by minutes. Small
             # buffer keeps playback near the live edge (~2-3s).
-            ["mpv", "--no-terminal", "--loop=inf", "--vo=null", "--ao=pipewire",
+            # No --loop: on EOF, --loop silently re-opens the URL and can
+            # land on stale edge-cached audio; the health watchdog reloads
+            # deliberately (and logs it) instead.
+            ["mpv", "--no-terminal", "--vo=null", "--ao=pipewire",
              "--cache=no", "--stream-buffer-size=64KiB", "--demuxer-readahead-secs=2",
              "--demuxer-max-bytes=512KiB", f"--input-ipc-server={MPV_SOCKET_PATH}", MPV_STREAM_URL],
             stdout=subprocess.DEVNULL,
