@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+import socket
+import sys
+import asyncio
+import datetime
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import threading
+import time
+from zoneinfo import ZoneInfo
+
+# MPRIS2 D-Bus integration (optional): advertises the radio to DMS's media
+# widget and any MPRIS consumer. jeepney is a pure-Python async D-Bus
+# library; if unavailable the radio still works, just without media-tab
+# integration.
+try:
+    from jeepney import DBusAddress, Message, MessageType, HeaderFields, new_method_call, new_method_return, new_error
+    from jeepney.io.asyncio import open_dbus_connection
+    from jeepney.wrappers import new_header
+
+    HAVE_JEEPNEY = True
+except Exception:
+    HAVE_JEEPNEY = False
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.rtl2"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT_IFACE = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+MPRIS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+MPRIS_INTRO_IFACE = "org.freedesktop.DBus.Introspectable"
+
+if sys.stdout is not None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+from pathlib import Path
+
+import aiohttp
+import html
+from typing import Optional, Tuple
+
+RTL2_PLAYLIST_URL = "https://www.rtl2.fr/quel-est-ce-titre/{date}"
+SOCKET_PATH = "/tmp/rtl2_radio.sock"
+LOCK_PATH = "/tmp/rtl2_radio.lock"
+MPV_STREAM_URL = "http://icecast.rtl2.fr/rtl2-1-44-128?listen=webCwsBCggNCQgLDQUGBAcGBg"
+SCRAPE_INTERVAL = 30
+MPV_SOCKET_PATH = "/tmp/mpv_rtl2_socket"
+current_metadata = {"title": "", "artist": "", "thumbnail": ""}
+daemon_registered = False
+is_playing = False
+mpv_process = None
+last_scrape_time = 0
+last_processed_action = None
+_lock_fd = None
+current_volume = None
+mpris = None
+last_mpv_attempt = 0
+
+
+def get_today_date():
+    # The quel-est-ce-titre page is keyed by the date in France
+    # (Europe/Paris), NOT the backend host's local date — the station is
+    # French and the page rolls over at midnight Paris time. Computing the
+    # date in a different timezone (e.g. PST) returns a frozen page.
+    return datetime.datetime.now(ZoneInfo("Europe/Paris")).strftime("%d-%m-%Y")
+
+
+def _acquire_lock():
+    """Single-instance lock (kernel flock, auto-released on process death).
+
+    The daemon respawns on channel loss and a manual start can race it;
+    without exclusion a second instance's startup would pkill the first's
+    mpv and unlink/bind over its socket file while the daemon stays
+    connected to the first (which then never gets HELLO). flock is atomic,
+    so the loser exits before touching anything destructive.
+    """
+    global _lock_fd
+    _lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[STARTUP] Another backend instance is already running, exiting")
+        return False
+    _lock_fd.write(str(os.getpid()) + "\n")
+    _lock_fd.flush()
+    return True
+
+
+def normalize_text(text):
+    if not text:
+        return ""
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&quot;", '"').replace("&apos;", "'")
+    text = text.replace("&nbsp;", " ")
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def _extract_thumbnail_from_markup(markup: str) -> Optional[str]:
+    """Extract thumbnail URL from srcset or img src."""
+    for srcset_match in re.finditer(r'(?:data-srcset|srcset)\s*=\s*"(?P<srcset>[^"]+)"', markup, re.IGNORECASE):
+        srcset = srcset_match.group("srcset")
+        for entry in srcset.split(","):
+            url = entry.strip().split(" ")[0]
+            if url.startswith("http"):
+                return url
+    for img_match in re.finditer(r'(?:data-src|src)\s*=\s*"(?P<src>[^"]+)"', markup, re.IGNORECASE):
+        src = img_match.group("src").strip()
+        if src and not src.lower().startswith("data:"):
+            return src
+    return None
+
+
+def _extract_from_player_markup(html_text: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """Extract artist/title/thumbnail from player markup."""
+    cover_match = re.search(r'<div[^>]+class="[^"]*container-cover[^"]*"[^>]*>(?P<cover>.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+    cover_url = None
+    if cover_match:
+        cover_url = _extract_thumbnail_from_markup(cover_match.group("cover"))
+    title_match = re.search(r'<div[^>]+data-player-title[^>]*>(?P<title>.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+    artist_match = re.search(r'<div[^>]+data-player-hosts[^>]*>(?P<artist>.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+    if not title_match and not artist_match:
+        return None
+    def _strip_tags(frag: str) -> str:
+        return re.sub(r"<[^>]+>", " ", frag).strip()
+    title = normalize_text(_strip_tags(title_match.group("title")) if title_match else "")
+    artist = normalize_text(_strip_tags(artist_match.group("artist")) if artist_match else "")
+    if not artist and not title:
+        return None
+    return artist, title, cover_url
+
+
+async def scrape_metadata():
+    global current_metadata, last_scrape_time
+    date_str = get_today_date()
+    # Cache-bust: rtl2.fr serves this page through a CDN with max-age=120,
+    # so the plain URL returns a copy up to ~2 minutes stale (the observed
+    # "widget shows the previous song" lag). A unique query param makes each
+    # scrape hit the origin, keeping titles near real-time.
+    url = RTL2_PLAYLIST_URL.format(date=date_str) + f"?cb={int(time.time() * 1000)}"
+    headers = {
+        "User-Agent": "rtl2-dms-widget/0.1",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return False
+                content = await resp.text()
+    except Exception as e:
+        print(f"[SCRAPE] Error fetching {url}: {e}", file=sys.stderr)
+        return False
+
+    # Extract card-qect JSON (primary source)
+    card_match = re.search(
+        r'<div[^>]+class="[^"]*card-qect[^"]*"[^>]*data-qect-info="(.*?)"',
+        content, re.IGNORECASE
+    )
+    if card_match:
+        try:
+            raw_info = html.unescape(card_match.group(1))
+            info = json.loads(raw_info)
+            artist = normalize_text(info.get("singer") or info.get("artist", ""))
+            title = normalize_text(info.get("title", ""))
+            thumbnail = info.get("thumbnail") or info.get("cover", "")
+            
+            if artist or title:
+                current_metadata = {
+                    "artist": artist,
+                    "title": title,
+                    "thumbnail": thumbnail
+                }
+                last_scrape_time = time.time()
+                return True
+        except Exception as e:
+            print(f"[SCRAPE] Failed to parse card-qect JSON: {e}", file=sys.stderr)
+
+    # Fallback: extract from player markup
+    result = _extract_from_player_markup(content)
+    if result:
+        artist, title, cover_url = result
+        current_metadata = {
+            "artist": artist,
+            "title": title,
+            "thumbnail": cover_url or ""
+        }
+        last_scrape_time = time.time()
+        return True
+
+    print("[SCRAPE] No metadata patterns matched", file=sys.stderr)
+    last_scrape_time = time.time()
+    return False
+
+
+def start_mpv():
+    global mpv_process, is_playing, last_mpv_attempt
+    last_mpv_attempt = time.time()
+    try:
+        if os.path.exists(MPV_SOCKET_PATH):
+            os.remove(MPV_SOCKET_PATH)
+        mpv_process = subprocess.Popen(
+            # Minimal network buffer: mpv's defaults read ~150s of audio
+            # ahead (2MiB stream buffer at 128kbps), so the audio trails the
+            # live broadcast — and the scraped metadata — by minutes. Small
+            # buffer keeps playback near the live edge (~2-3s).
+            ["mpv", "--no-terminal", "--loop=inf", "--vo=null", "--ao=pipewire",
+             "--cache=no", "--stream-buffer-size=64KiB", "--demuxer-readahead-secs=2",
+             "--demuxer-max-bytes=512KiB", f"--input-ipc-server={MPV_SOCKET_PATH}", MPV_STREAM_URL],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Wait for socket to be created
+        for _ in range(100):  # Wait up to 10 seconds
+            if os.path.exists(MPV_SOCKET_PATH):
+                break
+            time.sleep(0.1)
+        else:
+            print("[MPV] Socket not created after 10 seconds", file=sys.stderr)
+            return False
+        # Wait for process to be ready
+        time.sleep(1)
+        # Test communication
+        test_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            test_socket.connect(MPV_SOCKET_PATH)
+            test_socket.send(json.dumps({"command": ["get_property", "idle"]}).encode() + b"\n")
+            response = test_socket.recv(4096).decode()
+            if '"error":"success"' in response:
+                is_playing = True
+                print("[MPV] Started")
+                return True
+        except Exception as e:
+            print(f"[MPV] Error: {e}", file=sys.stderr)
+            return False
+        finally:
+            test_socket.close()
+    except Exception as e:
+        print(f"[MPV] Error: {e}", file=sys.stderr)
+        return False
+
+
+def stop_mpv():
+    global mpv_process, is_playing
+    if mpv_process:
+        try:
+            # Try graceful shutdown via IPC
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.connect(MPV_SOCKET_PATH)
+                cmd = json.dumps({"command": ["quit"]}).encode() + b"\n"
+                s.send(cmd)
+            except Exception:
+                pass
+            finally:
+                s.close()
+            mpv_process.terminate()
+            try:
+                mpv_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mpv_process.kill()
+            finally:
+                mpv_process = None
+        except Exception as e:
+            print(f"[MPV] Stop error: {e}", file=sys.stderr)
+        finally:
+            is_playing = False
+        if os.path.exists(MPV_SOCKET_PATH):
+            try:
+                os.remove(MPV_SOCKET_PATH)
+            except Exception:
+                pass
+        print("[MPV] Stopped")
+
+
+def _mpv_command(cmd_parts):
+    """Send a raw command to the mpv IPC socket; returns the response text or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(MPV_SOCKET_PATH)
+        s.send(json.dumps({"command": cmd_parts}).encode() + b"\n")
+        resp = s.recv(4096).decode()
+        s.close()
+        return resp
+    except OSError as e:
+        print(f"[MPV] command {cmd_parts} failed: {e}", file=sys.stderr)
+        return None
+
+
+def get_mpv_volume():
+    resp = _mpv_command(["get_property", "volume"])
+    if resp and '"error":"success"' in resp:
+        try:
+            return int(round(float(json.loads(resp).get("data", 0))))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def set_mpv_volume(vol):
+    """Set mpv volume (0-100) and track it as the current desired level."""
+    global current_volume
+    vol = max(0, min(100, int(vol)))
+    resp = _mpv_command(["set_property", "volume", vol])
+    if resp and '"error":"success"' in resp:
+        current_volume = vol
+        print(f"[VOLUME] Set mpv volume to {vol}", flush=True)
+        _mpris_emit({"Volume": ("d", vol / 100.0)})
+        return True
+    print(f"[VOLUME] Failed to set mpv volume to {vol}", file=sys.stderr)
+    return False
+
+
+def restart_mpv():
+    """Full mpv restart preserving volume and play state."""
+    print("[MPV] Restarting", flush=True)
+    stop_mpv()
+    if not start_mpv():
+        print("[MPV] Restart failed", file=sys.stderr)
+        return False
+    if current_volume is not None:
+        set_mpv_volume(current_volume)
+    resp = _mpv_command(["set_property", "pause", not is_playing])
+    if resp and '"error":"success"' in resp:
+        print(f"[MPV] State restored (paused={not is_playing})", flush=True)
+    return True
+
+
+def check_mpv_health():
+    """Recover from idle disconnects: the stream edge drops the connection
+    after a long pause, mpv hits EOF and ``loop=inf`` does not reliably
+    reopen the URL. Reload it when EOF is reached while playing; restart the
+    process if it died. Cheap (one local socket call), called every poll."""
+    global mpv_process, last_mpv_attempt
+    if mpv_process is None:
+        # mpv never started (e.g. pipewire not ready at login): retry
+        # occasionally so the boot chain self-heals.
+        if time.time() - last_mpv_attempt > 15:
+            print("[MPV] Not running, (re)starting", flush=True)
+            restart_mpv()
+        return
+    if mpv_process.poll() is not None:
+        print("[MPV] Process died, restarting", flush=True)
+        restart_mpv()
+        return
+    if not is_playing:
+        return
+    resp = _mpv_command(["get_property", "eof-reached"])
+    if not resp or '"error":"success"' not in resp:
+        return
+    try:
+        eof = json.loads(resp).get("data") is True
+    except Exception:
+        return
+    if eof:
+        print("[MPV] Stream EOF, reloading", flush=True)
+        _mpv_command(["loadfile", MPV_STREAM_URL])
+
+
+def set_play_state(playing):
+    """Explicitly set playing/paused (MPRIS Play/Pause)."""
+    global is_playing
+    if playing == is_playing:
+        return True
+    resp = _mpv_command(["set_property", "pause", not playing])
+    if resp and '"error":"success"' in resp:
+        is_playing = playing
+        print(f"[IPC] Set play state to {playing}", flush=True)
+        sync_to_dms_settings()
+        _mpris_emit({"PlaybackStatus": ("s", _mpris_playback_status())})
+        return True
+    print(f"[IPC] Failed to set play state to {playing}", file=sys.stderr)
+    return False
+
+
+# ---- MPRIS2 service -------------------------------------------------------
+
+MPRIS_INTROSPECT_XML = (
+    '<node>'
+    '<interface name="org.mpris.MediaPlayer2">'
+    '<property name="Identity" type="s" access="read"/>'
+    '<property name="CanQuit" type="b" access="read"/>'
+    '<property name="CanRaise" type="b" access="read"/>'
+    '<property name="CanSetFullscreen" type="b" access="read"/>'
+    '<property name="Fullscreen" type="b" access="readwrite"/>'
+    '<property name="SupportedUriSchemes" type="as" access="read"/>'
+    '<property name="SupportedMimeTypes" type="as" access="read"/>'
+    '</interface>'
+    '<interface name="org.mpris.MediaPlayer2.Player">'
+    '<property name="PlaybackStatus" type="s" access="read"/>'
+    '<property name="LoopStatus" type="s" access="readwrite"/>'
+    '<property name="Rate" type="d" access="readwrite"/>'
+    '<property name="Shuffle" type="b" access="readwrite"/>'
+    '<property name="Metadata" type="a{sv}" access="read"/>'
+    '<property name="Volume" type="d" access="readwrite"/>'
+    '<property name="Position" type="x" access="read"/>'
+    '<property name="MinimumRate" type="d" access="read"/>'
+    '<property name="MaximumRate" type="d" access="read"/>'
+    '<property name="CanGoNext" type="b" access="read"/>'
+    '<property name="CanGoPrevious" type="b" access="read"/>'
+    '<property name="CanPlay" type="b" access="read"/>'
+    '<property name="CanPause" type="b" access="read"/>'
+    '<property name="CanSeek" type="b" access="read"/>'
+    '<property name="CanControl" type="b" access="read"/>'
+    '<method name="Next"/><method name="Previous"/><method name="Pause"/>'
+    '<method name="PlayPause"/><method name="Stop"/><method name="Play"/>'
+    '<method name="Seek"><arg name="Offset" type="x" direction="in"/></method>'
+    '<method name="SetPosition"><arg name="TrackId" type="o" direction="in"/>'
+    '<arg name="Position" type="x" direction="in"/></method>'
+    '<method name="OpenUri"><arg name="Uri" type="s" direction="in"/></method>'
+    '</interface>'
+    '<interface name="org.freedesktop.DBus.Properties">'
+    '<method name="Get"><arg name="interface_name" type="s" direction="in"/>'
+    '<arg name="property_name" type="s" direction="in"/>'
+    '<arg name="value" type="v" direction="out"/></method>'
+    '<method name="GetAll"><arg name="interface_name" type="s" direction="in"/>'
+    '<arg name="properties" type="a{sv}" direction="out"/></method>'
+    '<method name="Set"><arg name="interface_name" type="s" direction="in"/>'
+    '<arg name="property_name" type="s" direction="in"/>'
+    '<arg name="value" type="v" direction="in"/></method>'
+    '<signal name="PropertiesChanged"><arg name="interface_name" type="s"/>'
+    '<arg name="changed_properties" type="a{sv}"/>'
+    '<arg name="invalidated_properties" type="as"/></signal>'
+    '</interface>'
+    '</node>'
+)
+
+
+def _mpris_playback_status():
+    if is_playing:
+        return "Playing"
+    if current_metadata.get("title"):
+        return "Paused"
+    return "Stopped"
+
+
+def _mpris_metadata_plain():
+    m = {}
+    if current_metadata.get("title"):
+        m["mpris:trackid"] = ("o", MPRIS_PATH + "/track")
+        m["xesam:title"] = ("s", current_metadata["title"])
+        artist = current_metadata.get("artist") or ""
+        if artist:
+            m["xesam:artist"] = ("as", [artist])
+        art = current_metadata.get("thumbnail") or ""
+        if art:
+            m["mpris:artUrl"] = ("s", art)
+    return m
+
+
+def _mpris_root_props():
+    return {
+        "Identity": ("s", "RTL2 Radio"),
+        "CanQuit": ("b", False),
+        "CanRaise": ("b", False),
+        "CanSetFullscreen": ("b", False),
+        "Fullscreen": ("b", False),
+        "SupportedUriSchemes": ("as", []),
+        "SupportedMimeTypes": ("as", []),
+    }
+
+
+def _mpris_player_props():
+    return {
+        "PlaybackStatus": ("s", _mpris_playback_status()),
+        "LoopStatus": ("s", "None"),
+        "Rate": ("d", 1.0),
+        "Shuffle": ("b", False),
+        "Metadata": ("a{sv}", _mpris_metadata_plain()),
+        "Volume": ("d", (current_volume if current_volume is not None else 100) / 100.0),
+        "Position": ("x", 0),
+        "MinimumRate": ("d", 1.0),
+        "MaximumRate": ("d", 1.0),
+        "CanGoNext": ("b", False),
+        "CanGoPrevious": ("b", False),
+        "CanPlay": ("b", True),
+        "CanPause": ("b", True),
+        "CanSeek": ("b", False),
+        "CanControl": ("b", True),
+    }
+
+
+def _mpris_emit(changed_plain):
+    """Schedule a PropertiesChanged emission (safe from sync code)."""
+    if mpris is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(mpris.emit_properties_changed(changed_plain))
+
+
+class MprisService:
+    """Minimal MPRIS2 player on the session bus (org.mpris.MediaPlayer2.rtl2).
+
+    Backed by jeepney's async connection: a listener task dispatches method
+    calls, and state changes are pushed via PropertiesChanged signals so
+    DMS's media widget and other MPRIS consumers stay in sync.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._last_metadata = None
+
+    # ---- state publishing ------------------------------------------------
+
+    def publish_metadata_if_changed(self):
+        meta = _mpris_metadata_plain()
+        if meta == self._last_metadata:
+            return
+        self._last_metadata = meta
+        _mpris_emit({"Metadata": ("a{sv}", meta)})
+
+    def publish_playback_if_changed(self):
+        _mpris_emit({"PlaybackStatus": ("s", _mpris_playback_status())})
+
+    async def emit_properties_changed(self, changed_plain):
+        if not changed_plain:
+            return
+        # jeepney encodes variant values as (signature, value) tuples; the
+        # body itself must be a tuple (multi-item signatures are a Struct).
+        body = (
+            MPRIS_PLAYER_IFACE,
+            dict(changed_plain),
+            [],
+        )
+        header = new_header(MessageType.signal)
+        header.fields[HeaderFields.path] = MPRIS_PATH
+        header.fields[HeaderFields.interface] = MPRIS_PROPS_IFACE
+        header.fields[HeaderFields.member] = "PropertiesChanged"
+        header.fields[HeaderFields.signature] = "sa{sv}as"
+        try:
+            await self.conn.send(Message(header, body))
+        except Exception as e:
+            print(f"[MPRIS] signal error: {e}", file=sys.stderr)
+
+    # ---- request handling ------------------------------------------------
+
+    async def run(self):
+        print("[MPRIS] Listening on " + MPRIS_NAME, flush=True)
+        while True:
+            try:
+                msg = await self.conn.receive()
+            except EOFError:
+                print("[MPRIS] D-Bus connection closed", file=sys.stderr)
+                return
+            if msg.header.message_type != MessageType.method_call:
+                continue
+            if msg.header.fields.get(HeaderFields.path) != MPRIS_PATH:
+                continue
+            try:
+                await self._dispatch(msg)
+            except Exception as e:
+                print(f"[MPRIS] handler error: {e}", file=sys.stderr)
+
+    async def _dispatch(self, msg):
+        iface = msg.header.fields.get(HeaderFields.interface)
+        member = msg.header.fields.get(HeaderFields.member)
+
+        if iface == MPRIS_PROPS_IFACE:
+            if member == "Get":
+                iface_name, prop = msg.body
+                for props in (_mpris_root_props(), _mpris_player_props()):
+                    if prop in props:
+                        sig, val = props[prop]
+                        await self.conn.send(new_method_return(msg, "v", ((sig, val),)))
+                        return
+                await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownProperty",
+                                               "s", (f"Unknown property {prop}",)))
+                return
+            if member == "GetAll":
+                iface_name = msg.body[0]
+                props = {}
+                if iface_name in (MPRIS_ROOT_IFACE, ""):
+                    props.update(_mpris_root_props())
+                if iface_name in (MPRIS_PLAYER_IFACE, ""):
+                    props.update(_mpris_player_props())
+                variants = dict(props)
+                await self.conn.send(new_method_return(msg, "a{sv}", (variants,)))
+                return
+            if member == "Set":
+                iface_name, prop, value = msg.body
+                # jeepney parses a 'v' argument as (signature, value)
+                if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+                    value = value[1]
+                if prop == "Volume":
+                    try:
+                        set_mpv_volume(int(round(float(value) * 100)))
+                        await self.conn.send(new_method_return(msg))
+                    except (ValueError, TypeError):
+                        await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.InvalidArgs",
+                                                       "s", ("Invalid volume",)))
+                else:
+                    await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.PropertyReadOnly",
+                                                   "s", (f"{prop} is read-only",)))
+                return
+            if member == "Introspect":
+                await self.conn.send(new_method_return(msg, "s", (MPRIS_INTROSPECT_XML,)))
+                return
+            await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownMethod",
+                                           "s", (f"Unknown method {member}",)))
+            return
+
+        if iface in (MPRIS_ROOT_IFACE, MPRIS_PLAYER_IFACE):
+            if member in ("Play", "Pause", "PlayPause", "Stop", "Next", "Previous",
+                          "Seek", "SetPosition", "OpenUri"):
+                sender = msg.header.fields.get(HeaderFields.sender, "?")
+                print(f"[MPRIS] {member} requested by {sender}", flush=True)
+                if member == "Play":
+                    set_play_state(True)
+                elif member == "Pause":
+                    set_play_state(False)
+                elif member == "PlayPause":
+                    toggle_play()
+                elif member == "Stop":
+                    set_play_state(False)
+                await self.conn.send(new_method_return(msg))
+                return
+            await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownMethod",
+                                           "s", (f"Unknown method {member}",)))
+            return
+
+        if iface == MPRIS_INTRO_IFACE and member == "Introspect":
+            await self.conn.send(new_method_return(msg, "s", (MPRIS_INTROSPECT_XML,)))
+            return
+
+        await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownInterface",
+                                       "s", (f"Unknown interface {iface}",)))
+
+
+async def start_mpris():
+    """Connect to the session bus, claim the MPRIS name, return the service."""
+    global mpris
+    if not HAVE_JEEPNEY:
+        print("[MPRIS] jeepney not installed, media integration disabled", file=sys.stderr)
+        return None
+    try:
+        conn = await open_dbus_connection(bus="SESSION")
+    except Exception as e:
+        print(f"[MPRIS] Cannot connect to session bus: {e}", file=sys.stderr)
+        return None
+    svc = MprisService(conn)
+    try:
+        reply = await conn.send(new_method_call(
+            DBusAddress(bus_name="org.freedesktop.DBus",
+                        object_path="/org/freedesktop/DBus",
+                        interface="org.freedesktop.DBus"),
+            "RequestName", "su", (MPRIS_NAME, 0x4)))
+        # Broadcasts (e.g. NameOwnerChanged) may arrive before the reply;
+        # drain until the actual method reply shows up.
+        while True:
+            reply = await conn.receive()
+            if reply.header.message_type in (MessageType.method_return, MessageType.error):
+                break
+        if reply.header.message_type == MessageType.error:
+            print(f"[MPRIS] Name {MPRIS_NAME} already owned: {reply.body}", file=sys.stderr)
+            return None
+        primary = reply.body[0]
+        if primary != 1:
+            print(f"[MPRIS] RequestName returned {primary}, continuing anyway", file=sys.stderr)
+    except Exception as e:
+        print(f"[MPRIS] Name request failed: {e}", file=sys.stderr)
+        return None
+    mpris = svc
+    return svc
+
+
+def toggle_play():
+    """Toggle play/pause state via IPC socket"""
+    global is_playing
+    print(f"[DEBUG] toggle_play called, current is_playing={is_playing}")
+    try:
+        # Retry up to 3 times with short delays
+        for attempt in range(3):
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(2.0)
+                s.connect(MPV_SOCKET_PATH)
+                # Toggle: if playing, pause; if paused, resume
+                new_pause_state = is_playing  # If playing, set pause=True; if paused, set pause=False
+                cmd = json.dumps({"command": ["set_property", "pause", new_pause_state]}).encode() + b"\n"
+                print(f"[DEBUG] Connecting to MPV socket: {MPV_SOCKET_PATH}")
+                print(f"[DEBUG] Sending IPC command: {cmd}")
+                s.send(cmd)
+                # Read response with timeout
+                try:
+                    resp = s.recv(4096).decode()
+                    print(f"[DEBUG] MPV response: {resp[:200]}")
+                except socket.timeout:
+                    print(f"[DEBUG] MPV no response on attempt {attempt+1}")
+                s.close()
+                is_playing = not is_playing
+                print(f"[IPC] Toggled play state to {is_playing}")
+                _mpris_emit({"PlaybackStatus": ("s", _mpris_playback_status())})
+                return True
+            except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+                print(f"[IPC] Attempt {attempt+1}/3 failed: {e}")
+                if attempt < 2:
+                    time.sleep(0.5)
+                else:
+                    print(f"[IPC] All attempts failed", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"[IPC] Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def get_play_state():
+    return is_playing
+
+
+def get_metadata():
+    return json.dumps(current_metadata)
+
+
+
+def write_settings(plugin_settings):
+    """Atomically write plugin settings (temp file + rename) to avoid partial reads."""
+    settings_path = Path.home() / ".config" / "DankMaterialShell" / "plugin_settings.json"
+    tmp_path = settings_path.with_name(settings_path.name + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(plugin_settings, f, indent=2)
+    os.replace(tmp_path, settings_path)
+
+
+def sync_to_dms_settings():
+    """Sync current metadata and play state to DMS plugin settings"""
+    try:
+        # Build settings JSON
+        settings = {
+            "title": current_metadata.get("title", ""),
+            "artist": current_metadata.get("artist", ""),
+            "artUrl": current_metadata.get("thumbnail", ""),
+            "isPlaying": is_playing,
+            "connectionStatus": "connected"
+        }
+
+        # Read existing settings, preserving fields owned by the widget/DMS (e.g. action)
+        settings_path = Path.home() / ".config" / "DankMaterialShell" / "plugin_settings.json"
+        plugin_settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r") as f:
+                    plugin_settings = json.load(f)
+            except Exception as e:
+                print(f"[SETTINGS] Error reading settings: {e}", file=sys.stderr)
+
+        if "rtl2RadioWidget" in plugin_settings:
+            existing = plugin_settings["rtl2RadioWidget"]
+            for key in existing:
+                if key not in ("title", "artist", "artUrl", "isPlaying", "connectionStatus"):
+                    settings[key] = existing[key]
+        plugin_settings["rtl2RadioWidget"] = settings
+
+        write_settings(plugin_settings)
+        print(f"[SETTINGS] Synced to DMS: {settings}")
+    except Exception as e:
+        print(f"[SETTINGS] Error syncing to DMS: {e}", file=sys.stderr)
+
+
+def process_widget_action():
+    """Read plugin_settings.json and process a pending widget action.
+
+    The QML widget writes a unique ``toggle:<timestamp>`` action per click
+    (unique so DMS's FileView write-dedupe never suppresses it). We match any
+    action starting with "toggle", process it at most once, then clear it.
+    """
+    global last_processed_action
+    settings_path = Path.home() / ".config" / "DankMaterialShell" / "plugin_settings.json"
+    try:
+        if not settings_path.exists():
+            return False
+        with open(settings_path, "r") as f:
+            plugin_settings = json.load(f)
+        widget_settings = plugin_settings.get("rtl2RadioWidget")
+        action = widget_settings.get("action") if widget_settings else None
+        if action is None:
+            # Backward compatibility: action at top level
+            action = plugin_settings.get("action")
+        if not action or not str(action).startswith("toggle"):
+            return False
+
+        if action == last_processed_action:
+            print(f"[SETTINGS] Duplicate action {action!r} skipped (already processed)")
+        else:
+            last_processed_action = action
+            print(f"[SETTINGS] Toggle command received: {action!r}")
+            toggle_play()
+            sync_to_dms_settings()
+
+        # Clear the processed action unless a newer one arrived in the meantime
+        with open(settings_path, "r") as f:
+            plugin_settings = json.load(f)
+        widget_settings = plugin_settings.get("rtl2RadioWidget")
+        if widget_settings and widget_settings.get("action") == action:
+            widget_settings["action"] = None
+            plugin_settings["rtl2RadioWidget"] = widget_settings
+            write_settings(plugin_settings)
+        return True
+    except Exception as e:
+        print(f"[SETTINGS] Error checking commands: {e}", file=sys.stderr)
+        return False
+
+def process_widget_volume():
+    """Apply a volume level written by the widget (settings 'volume' key).
+
+    The widget is the only volume controller; the stored value is the
+    desired level, so we apply it only when it differs from what mpv
+    currently has.
+    """
+    global current_volume
+    settings_path = Path.home() / ".config" / "DankMaterialShell" / "plugin_settings.json"
+    try:
+        if not settings_path.exists():
+            return
+        with open(settings_path, "r") as f:
+            plugin_settings = json.load(f)
+        widget_settings = plugin_settings.get("rtl2RadioWidget") or {}
+        vol = widget_settings.get("volume")
+        if vol is None:
+            return
+        vol = max(0, min(100, int(vol)))
+        if current_volume is not None and vol == current_volume:
+            return
+        set_mpv_volume(vol)
+    except Exception as e:
+        print(f"[VOLUME] Error processing: {e}", file=sys.stderr)
+
+
+def check_for_commands():
+    """Check for incoming commands from QML widget (slow path, called from scrape loop)."""
+    process_widget_action()
+
+async def handle_socket(reader, writer):
+    global is_playing, daemon_registered
+    try:
+        data = await reader.read(1024)
+        if not data:
+            return
+        message = data.decode().strip()
+        if message == "HELLO":
+            # Persistent daemon registration channel. The daemon keeps this
+            # connection open for its whole lifetime; EOF (daemon died, DMS
+            # crashed/quitted) or QUIT (clean unload) shuts us down. This
+            # distinguishes daemon death from the daemon's transient health
+            # probes, which connect and close without sending anything.
+            daemon_registered = True
+            print("[DAEMON] Registered", flush=True)
+            while True:
+                more = await reader.read(1024)
+                if not more:
+                    print("[DAEMON] Connection lost, shutting down", flush=True)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+                cmd = more.decode().strip()
+                if cmd == "QUIT":
+                    print("[DAEMON] QUIT received, shutting down", flush=True)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+        elif message == "PLAY":
+            if not is_playing:
+                toggle_play()
+                sync_to_dms_settings()
+                writer.write(b"OK\n")
+                writer.write(json.dumps({"playing": True, "metadata": current_metadata}).encode() + b"\n")
+            else:
+                writer.write(b"ALREADY_PLAYING\n")
+        elif message == "PAUSE":
+            if is_playing:
+                toggle_play()
+                sync_to_dms_settings()
+                writer.write(b"OK\n")
+                writer.write(json.dumps({"playing": False, "metadata": current_metadata}).encode() + b"\n")
+            else:
+                writer.write(b"ALREADY_PAUSED\n")
+        elif message == "TOGGLE":
+            toggle_play()
+            sync_to_dms_settings()
+            writer.write(json.dumps({"playing": is_playing, "metadata": current_metadata}).encode() + b"\n")
+        elif message == "STATUS":
+            state = "playing" if is_playing else "paused"
+            writer.write(f"{state}\n".encode())
+        elif message == "VOLUME" or message.startswith("VOLUME:"):
+            if ":" in message:
+                try:
+                    set_mpv_volume(int(message.split(":", 1)[1]))
+                except ValueError:
+                    writer.write(b"INVALID_VOLUME\n")
+                    await writer.drain()
+                    return
+            vol = get_mpv_volume()
+            if vol is None:
+                vol = current_volume
+            writer.write(json.dumps({"volume": vol}).encode() + b"\n")
+        elif message == "METADATA" or message == "GET_METADATA":
+            writer.write(get_metadata().encode() + b"\n")
+        elif message == "QUIT":
+            writer.write(b"OK\n")
+            await writer.drain()
+            # Same clean-shutdown path as SIGTERM: unwinds main() -> stop_mpv()
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            writer.write(b"UNKNOWN_COMMAND\n")
+        await writer.drain()
+    except Exception as e:
+        print(f"[SOCKET] Error: {e}", file=sys.stderr)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def _await_daemon_registration():
+    await asyncio.sleep(15)
+    if not daemon_registered:
+        print("[DAEMON] No daemon registration within 15s, shutting down", flush=True)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def toggle_poll_loop():
+    """Poll for widget actions every 1s for responsive toggle."""
+    while True:
+        process_widget_action()
+        process_widget_volume()
+        check_mpv_health()
+        await asyncio.sleep(1)
+async def scrape_loop():
+    while True:
+        success = await scrape_metadata()
+        if success:
+            print(f"[SCRAPE] Success: {current_metadata['artist']} - {current_metadata['title']}")
+            # Sync to DMS settings
+            sync_to_dms_settings()
+            # Push to MPRIS consumers (media widget) if the track changed
+            if mpris:
+                mpris.publish_metadata_if_changed()
+            # Check for incoming commands
+            check_for_commands()
+        else:
+            print("[SCRAPE] Failed", file=sys.stderr)
+        await asyncio.sleep(SCRAPE_INTERVAL)
+
+
+async def socket_server():
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+    server = await asyncio.start_unix_server(handle_socket, SOCKET_PATH)
+    async with server:
+        print(f"[SOCKET] Listening on {SOCKET_PATH}")
+        await server.serve_forever()
+
+
+async def main():
+    global current_metadata, is_playing
+    current_metadata = {"title": "Loading...", "artist": "RTL2", "thumbnail": ""}
+    # Single-instance lock: a racy second start (daemon respawn vs manual
+    # nohup) exits here, before any pkill/socket side effects.
+    if not _acquire_lock():
+        return
+    # Adopt-and-exit if another backend instance is already serving (daemon
+    # respawn race, manual nohup start). Runs BEFORE pkill so we never kill a
+    # live instance's mpv.
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(SOCKET_PATH)
+        s.send(b"STATUS\n")
+        resp = s.recv(64).decode().strip()
+        s.close()
+        if resp in ("playing", "paused"):
+            print("[STARTUP] Backend already running, exiting")
+            return
+    except OSError:
+        pass
+    _start_parent_watchdog()
+    # Spawned by the daemon: require its HELLO registration within a grace
+    # period, else the plugin is already gone (disable raced backend
+    # startup) and we must not linger with a playing mpv.
+    if "--daemon-spawned" in sys.argv:
+        asyncio.create_task(_await_daemon_registration())
+
+    # Kill old processes
+    kill_procs = ["pkill", "-f", "mpv.*rtl2"]
+    proc = await asyncio.create_subprocess_exec(*kill_procs, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    await proc.wait()
+    await asyncio.sleep(0.5)
+    # Ensure socket file is gone
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.remove(SOCKET_PATH)
+        except Exception:
+            pass
+    # (legacy toggle request files removed: the widget now writes via settings)
+    # Start mpv (paused — user clicks to begin playback)
+    if not start_mpv():
+        print("[RTL2] Failed to start mpv", file=sys.stderr)
+        return
+    # Immediately pause so first click starts playback
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(MPV_SOCKET_PATH)
+        s.send(json.dumps({"command": ["set_property", "pause", True]}).encode() + b"\n")
+        s.recv(4096)
+        s.close()
+        is_playing = False
+        print("[MPV] Started in paused state")
+    except Exception as e:
+        print(f"[MPV] Failed to pause at startup: {e}", file=sys.stderr)
+    # Clear any stale toggle action from previous session
+    settings_path = Path.home() / ".config" / "DankMaterialShell" / "plugin_settings.json"
+    try:
+        if settings_path.exists():
+            with open(settings_path, "r") as f:
+                ps = json.load(f)
+            if "rtl2RadioWidget" in ps:
+                ps["rtl2RadioWidget"]["action"] = None
+                ps["rtl2RadioWidget"]["isPlaying"] = False
+                ps["rtl2RadioWidget"].setdefault("volume", 100)
+                write_settings(ps)
+                print("[STARTUP] Cleared stale action, set isPlaying=False")
+    except Exception as e:
+        print(f"[STARTUP] Error clearing settings: {e}", file=sys.stderr)
+    # Restore the last volume level (default 100 to match mpv)
+    try:
+        with open(settings_path, "r") as f:
+            ps = json.load(f)
+        vol = (ps.get("rtl2RadioWidget") or {}).get("volume", 100)
+        set_mpv_volume(vol)
+    except Exception as e:
+        print(f"[STARTUP] Error restoring volume: {e}", file=sys.stderr)
+    # Advertise as an MPRIS2 player (media widget integration); optional
+    mpris_svc = await start_mpris()
+    # Start scrape loop
+    scrape_task = asyncio.create_task(scrape_loop())
+    socket_task = asyncio.create_task(socket_server())
+    toggle_task = asyncio.create_task(toggle_poll_loop())
+    tasks = [scrape_task, socket_task, toggle_task]
+    if mpris_svc:
+        tasks.append(asyncio.create_task(mpris_svc.run()))
+    print("[RTL2] Backend Manager Started")
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        stop_mpv()
+        if os.path.exists(SOCKET_PATH):
+            try:
+                os.remove(SOCKET_PATH)
+            except Exception:
+                pass
+
+
+def _sigterm_handler(signum, frame):
+    """Graceful shutdown on SIGTERM (daemon unload, systemd, manual kill).
+
+    Shutdown must happen HERE, not in main()'s finally: a SystemExit raised
+    from a signal handler interrupts asyncio.run from the main thread and
+    the awaited coroutine is never unwound, so its finally never executes.
+    stop_mpv() is fully synchronous (socket + Popen.terminate), safe here.
+
+    Exit with os._exit, NOT raise SystemExit: a SystemExit raised from a
+    signal handler while the event loop is executing a task callback is
+    captured as an unretrieved task exception and the process lingers
+    without mpv, still holding the socket (observed zombie).
+    """
+    print("[RTL2] SIGTERM received, shutting down", flush=True)
+    stop_mpv()
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.remove(SOCKET_PATH)
+        except Exception:
+            pass
+    os._exit(0)
+
+
+
+def _start_parent_watchdog():
+    """Self-shutdown when the spawning parent dies.
+
+    The daemon's Process child is killed by quickshell when the plugin is
+    disabled or DMS quits/crashes; we get reparented and would otherwise
+    linger forever with an orphaned mpv. A manual/nohup start (shell parent)
+    keeps working as before. Polls every 2s; shutdown is synchronous here
+    (stop_mpv + socket removal) then os._exit, since this runs off the
+    asyncio main thread.
+    """
+    ppid = os.getppid()
+    if ppid <= 1:
+        return
+    try:
+        with open(f"/proc/{ppid}/comm") as f:
+            parent_comm = f.read().strip()
+    except OSError:
+        return
+    if parent_comm != "qs":
+        print(f"[WATCHDOG] Parent is {parent_comm}, not watching")
+        return
+    print(f"[WATCHDOG] Watching parent {ppid}")
+
+    def _watch():
+        # SIGTERM must always be handled on the main thread: a SystemExit
+        # raised in this thread would be silently swallowed and the backend
+        # would survive a shutdown request. Block it here so the kernel
+        # delivers it to the main thread.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        while True:
+            time.sleep(2)
+            if os.getppid() != ppid:
+                print("[WATCHDOG] Parent died, shutting down", flush=True)
+                stop_mpv()
+                if os.path.exists(SOCKET_PATH):
+                    try:
+                        os.remove(SOCKET_PATH)
+                    except Exception:
+                        pass
+                os._exit(0)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("\n[RTL2] Stopped by user")

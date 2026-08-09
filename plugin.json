@@ -1,0 +1,26 @@
+{
+    "id": "rtl2RadioWidget",
+    "name": "RTL2 Radio",
+    "description": "Live RTL2 radio with album art and media-tab integration",
+    "version": "1.0.1",
+    "author": "Remy",
+    "type": "composite",
+    "capabilities": [
+        "dankbar-widget",
+        "daemon",
+        "audio"
+    ],
+    "components": {
+        "widget": "./RadioWidget.qml",
+        "daemon": "./BackendDaemon.qml"
+    },
+    "dependencies": [
+        "mpv",
+        "python3-aiohttp",
+        "python3-jeepney"
+    ],
+    "icon": "radio",
+    "requires_dms": ">=1.5.0",
+    "license": "MIT",
+    "permissions": []
+}

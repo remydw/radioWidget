@@ -1,0 +1,2 @@
+module rtl2RadioWidget
+PluginComponent 1.0 RadioWidget.qml
