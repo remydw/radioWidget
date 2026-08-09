@@ -947,10 +947,11 @@ async def scrape_loop():
         success = await scrape_metadata()
         if success:
             print(f"[SCRAPE] Success: {current_metadata['artist']} - {current_metadata['title']}")
-            # Delay sync by ~30s so the display updates when the audio has
-            # actually reached that track (mpv's demuxer/buffering keeps
-            # playback ~30s behind the live edge).
-            await asyncio.sleep(SCRAPE_INTERVAL)
+            # Delay sync so the display updates when the audio has actually
+            # reached that track.  mpv's demuxer/buffering keeps playback
+            # ~30s behind the live edge; the extra 15s accounts for the
+            # scrape interval and page-update latency.
+            await asyncio.sleep(SCRAPE_INTERVAL + 15)
             sync_to_dms_settings()
             # Push to MPRIS consumers (media widget) if the track changed
             if mpris:
