@@ -956,10 +956,7 @@ async def scrape_loop():
             check_for_commands()
             # Delay the settings-file sync so the bar widget shows the
             # update when the audio has actually reached that track.
-            # mpv's demuxer/buffering keeps playback ~30s behind the live
-            # edge; the extra 15s accounts for scrape interval and
-            # page-update latency.
-            await asyncio.sleep(SCRAPE_INTERVAL + 15)
+            await asyncio.sleep(SCRAPE_INTERVAL - 10)
             sync_to_dms_settings()
         else:
             print("[SCRAPE] Failed", file=sys.stderr)
