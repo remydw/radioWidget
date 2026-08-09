@@ -322,6 +322,12 @@ def set_mpv_volume(vol):
     return False
 
 
+# NOTE: the RTL2 icecast stream doesn't carry icy-title metadata
+# (confirmed via direct probe), so we can't query mpv for the current
+# track.  Instead we delay the scrape-to-display sync by ~30s to
+# compensate for mpv's audio buffer.
+
+
 def restart_mpv():
     """Full mpv restart preserving volume and play state."""
     print("[MPV] Restarting", flush=True)
@@ -941,7 +947,10 @@ async def scrape_loop():
         success = await scrape_metadata()
         if success:
             print(f"[SCRAPE] Success: {current_metadata['artist']} - {current_metadata['title']}")
-            # Sync to DMS settings
+            # Delay sync by ~30s so the display updates when the audio has
+            # actually reached that track (mpv's demuxer/buffering keeps
+            # playback ~30s behind the live edge).
+            await asyncio.sleep(SCRAPE_INTERVAL)
             sync_to_dms_settings()
             # Push to MPRIS consumers (media widget) if the track changed
             if mpris:
@@ -950,7 +959,7 @@ async def scrape_loop():
             check_for_commands()
         else:
             print("[SCRAPE] Failed", file=sys.stderr)
-        await asyncio.sleep(SCRAPE_INTERVAL)
+            await asyncio.sleep(SCRAPE_INTERVAL)
 
 
 async def socket_server():
