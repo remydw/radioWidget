@@ -1,8 +1,8 @@
 {
     "id": "rtl2RadioWidget",
     "name": "Radio Widget",
-    "description": "Multi-station radio: RTL2 (France) and Dance 89.5 (Seattle) with album art and media-tab integration",
-    "version": "1.1.0",
+    "description": "Multi-station radio: RTL2 (France) and C89.5 (Seattle) with album art, MPRIS media-tab integration, and station switching via Next/Previous",
+    "version": "1.2.0",
     "author": "Remy",
     "type": "composite",
     "capabilities": [

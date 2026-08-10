@@ -508,7 +508,7 @@ def _mpris_metadata_plain():
         artist = current_metadata.get("artist") or ""
         if artist:
             m["xesam:artist"] = ("as", [artist])
-        art = current_metadata.get("thumbnail") or ""
+        art = current_metadata.get("thumbnail") or current_station_info().get("logo_url", "")
         if art:
             m["mpris:artUrl"] = ("s", art)
     return m
@@ -537,8 +537,8 @@ def _mpris_player_props():
         "Position": ("x", 0),
         "MinimumRate": ("d", 1.0),
         "MaximumRate": ("d", 1.0),
-        "CanGoNext": ("b", False),
-        "CanGoPrevious": ("b", False),
+        "CanGoNext": ("b", True),
+        "CanGoPrevious": ("b", True),
         "CanPlay": ("b", True),
         "CanPause": ("b", True),
         "CanSeek": ("b", False),
@@ -666,6 +666,18 @@ class MprisService:
                     toggle_play()
                 elif member == "Stop":
                     set_play_state(False)
+                elif member == "Next":
+                    station_ids = list(STATIONS.keys())
+                    idx = station_ids.index(current_station) if current_station in station_ids else -1
+                    next_id = station_ids[(idx + 1) % len(station_ids)]
+                    if next_id != current_station:
+                        switch_station(next_id)
+                elif member == "Previous":
+                    station_ids = list(STATIONS.keys())
+                    idx = station_ids.index(current_station) if current_station in station_ids else -1
+                    prev_id = station_ids[(idx - 1) % len(station_ids)]
+                    if prev_id != current_station:
+                        switch_station(prev_id)
                 await self.conn.send(new_method_return(msg))
                 return
             await self.conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownMethod",
@@ -769,7 +781,7 @@ def sync_to_dms_settings():
         settings = {
             "title": current_metadata.get("title", ""),
             "artist": current_metadata.get("artist", ""),
-            "artUrl": current_metadata.get("thumbnail", ""),
+            "artUrl": current_metadata.get("thumbnail", "") or current_station_info().get("logo_url", ""),
             "isPlaying": is_playing,
             "station": current_station,
             "connectionStatus": "connected",
@@ -820,8 +832,8 @@ def process_widget_action():
                 print(f"[SETTINGS] Toggle command received: {action!r}")
                 if not is_playing and mpv_process is None:
                     restart_mpv()
-                    is_playing = True
-                toggle_play()
+                else:
+                    toggle_play()
                 sync_to_dms_settings()
 
             # Clear processed action

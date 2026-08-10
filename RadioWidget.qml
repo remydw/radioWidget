@@ -10,8 +10,6 @@ PluginComponent {
     id: root
     readonly property string pluginId: "rtl2RadioWidget"
 
-    signal toggleRequested
-
     // Resolve the DMS settings file for the current user (same derivation
     // as DMS's own SettingsData): ~/.config/DankMaterialShell/...
     readonly property string settingsPath: Paths.strip(StandardPaths.writableLocation(StandardPaths.ConfigLocation)) + "/DankMaterialShell/plugin_settings.json"
@@ -24,7 +22,7 @@ PluginComponent {
             "fallbackLogo": "https://www.rtl2.fr/apple-touch-icon.png"
         },
         "dance895": {
-            "name": "Dance 89.5",
+            "name": "C89.5",
             "logo": "https://www.dance895.org/wp-content/uploads/2024/08/logo.svg",
             "fallbackLogo": "https://www.dance895.org/wp-content/uploads/2024/08/cropped-DANCE895_SiteIcon-1-270x270.png"
         }
@@ -83,7 +81,7 @@ PluginComponent {
         }
     }
 
-    // ---- Toggle / settings writes -----------------------------------------
+    // ---- Click / settings writes -----------------------------------------
     function writeWidgetField(key, value) {
         try {
             const parsed = JSON.parse(stateFile.text() || "{}")
@@ -96,90 +94,90 @@ PluginComponent {
         }
     }
 
-    Connections {
-        target: root
-        function onToggleRequested() {
-            root.writeWidgetField("action", "toggle:" + Date.now())
-        }
-    }
-
     // ---- Pill: play/pause icon + station name ------------------------------
-    horizontalBarPill: Item {
-        implicitWidth: hIcon.implicitWidth + hText.implicitWidth + Theme.spacingS * 3
-        implicitHeight: Theme.iconSize + 8
+    // MouseArea handles click (toggle playback) and wheel (volume). Hover
+    // passes through to BasePill (hoverEnabled defaults false) which shows
+    // the popout via triggerHoverPopout (pillClickAction is null).
+    horizontalBarPill: Component {
+        Item {
+            implicitWidth: hIcon.implicitWidth + hText.implicitWidth + Theme.spacingS * 3
+            implicitHeight: Theme.iconSize + 8
 
-        MouseArea {
-            anchors.fill: parent
-            onClicked: root.toggleRequested()
-            onWheel: wheelEvent => {
-                root.wheelVolume(wheelEvent.angleDelta.y > 0 ? 5 : -5)
-                wheelEvent.accepted = true
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.writeWidgetField("action", "toggle:" + Date.now())
+                onWheel: wheelEvent => {
+                    root.wheelVolume(wheelEvent.angleDelta.y > 0 ? 5 : -5)
+                    wheelEvent.accepted = true
+                }
             }
-        }
 
-        DankIcon {
-            id: hIcon
-            name: root.isPlaying ? "pause" : "radio"
-            color: Theme.primary
-            size: Theme.iconSize - 4
-            anchors.left: parent.left
-            anchors.leftMargin: Theme.spacingS
-            anchors.verticalCenter: parent.verticalCenter
-        }
+            DankIcon {
+                id: hIcon
+                name: root.isPlaying ? "pause" : "radio"
+                color: Theme.primary
+                size: Theme.iconSize - 4
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+            }
 
-        StyledText {
-            id: hText
-            text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
-            color: Theme.surfaceText
-            font.pixelSize: Theme.fontSizeSmall
-            elide: Text.ElideRight
-            wrapMode: Text.NoWrap
-            anchors.left: hIcon.right
-            anchors.leftMargin: Theme.spacingXS
-            anchors.right: parent.right
-            anchors.rightMargin: Theme.spacingS
-            anchors.verticalCenter: parent.verticalCenter
+            StyledText {
+                id: hText
+                text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeSmall
+                elide: Text.ElideRight
+                wrapMode: Text.NoWrap
+                anchors.left: hIcon.right
+                anchors.leftMargin: Theme.spacingXS
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+            }
         }
     }
 
-    verticalBarPill: Item {
-        implicitWidth: Math.max(Theme.iconSize + Theme.spacingS * 2, vText.implicitWidth + Theme.spacingS * 2)
-        implicitHeight: Theme.spacingS + (Theme.iconSize - 4) + Theme.spacingXS + vText.implicitHeight + Theme.spacingS
+    verticalBarPill: Component {
+        Item {
+            implicitWidth: Math.max(Theme.iconSize + Theme.spacingS * 2, vText.implicitWidth + Theme.spacingS * 2)
+            implicitHeight: Theme.spacingS + (Theme.iconSize - 4) + Theme.spacingXS + vText.implicitHeight + Theme.spacingS
 
-        MouseArea {
-            anchors.fill: parent
-            onClicked: root.toggleRequested()
-            onWheel: wheelEvent => {
-                root.wheelVolume(wheelEvent.angleDelta.y > 0 ? 5 : -5)
-                wheelEvent.accepted = true
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.writeWidgetField("action", "toggle:" + Date.now())
+                onWheel: wheelEvent => {
+                    root.wheelVolume(wheelEvent.angleDelta.y > 0 ? 5 : -5)
+                    wheelEvent.accepted = true
+                }
             }
-        }
 
-        DankIcon {
-            id: vIcon
-            name: root.isPlaying ? "pause" : "radio"
-            color: Theme.primary
-            size: Theme.iconSize - 4
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.top: parent.top
-            anchors.topMargin: Theme.spacingS
-        }
+            DankIcon {
+                id: vIcon
+                name: root.isPlaying ? "pause" : "radio"
+                color: Theme.primary
+                size: Theme.iconSize - 4
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.top: parent.top
+                anchors.topMargin: Theme.spacingS
+            }
 
-        StyledText {
-            id: vText
-            text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
-            color: Theme.surfaceText
-            font.pixelSize: Theme.fontSizeSmall
-            elide: Text.ElideRight
-            wrapMode: Text.NoWrap
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.top: vIcon.bottom
-            anchors.topMargin: Theme.spacingXS
+            StyledText {
+                id: vText
+                text: root.volDisplay >= 0 ? root.volDisplay + "%" : root.stationInfo.name
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeSmall
+                elide: Text.ElideRight
+                wrapMode: Text.NoWrap
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.top: vIcon.bottom
+                anchors.topMargin: Theme.spacingXS
+            }
         }
     }
 
     popoutWidth: 380
-    popoutHeight: 320
+    popoutHeight: 360
 
     // ---- Popout content ---------------------------------------------------
     popoutContent: Component {
@@ -189,29 +187,31 @@ PluginComponent {
             spacing: Theme.spacingS
             property var closePopout: root.closePopout
 
-            // Album art — track art while playing, station logo when paused
+            // Album art — cascade: current track art → station logo → fallback icon
             Item {
                 width: parent.width
-                height: 170
+                height: 150
                 Image {
+                    id: artImage
                     anchors.centerIn: parent
-                    width: 150
-                    height: 150
-                    source: root.isPlaying ? root.artUrl : root.stationLogoUrl
+                    width: 130
+                    height: 130
+                    source: {
+                        if (root.isPlaying && root.artUrl.length > 0)
+                            return root.artUrl
+                        return root.stationLogoUrl
+                    }
                     fillMode: Image.PreserveAspectFit
                     asynchronous: true
-                    visible: root.isPlaying ? root.artUrl.length > 0 : true
-                    onStatusChanged: {
-                        if (status === Image.Error && source === root.stationLogoUrl)
-                            root.stationLogoUrl = root.stationInfo.fallbackLogo
-                    }
+                    sourceSize.width: 300
+                    visible: status !== Image.Error
                 }
                 DankIcon {
                     anchors.centerIn: parent
                     name: "music_note"
                     size: 96
                     color: Theme.surfaceVariantText
-                    visible: root.isPlaying && root.artUrl.length === 0
+                    visible: artImage.status === Image.Error
                 }
             }
 
