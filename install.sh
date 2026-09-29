@@ -22,23 +22,21 @@ for f in "${FILES[@]}"; do
 done
 echo "    Installed to: $PLUGIN_DIR"
 
-# 2. Python dependencies (aiohttp = scraper, jeepney = MPRIS media-tab integration)
-python_deps=()
-python3 -c "import aiohttp" 2>/dev/null || python_deps+=("aiohttp")
-python3 -c "import jeepney" 2>/dev/null || python_deps+=("jeepney")
-if [ ${#python_deps[@]} -gt 0 ]; then
-    echo "==> Installing Python dependencies: ${python_deps[*]}"
-    pip3 install --break-system-packages "${python_deps[@]}" 2>/dev/null \
-        || pip3 install "${python_deps[@]}" 2>/dev/null \
-        || echo "WARNING: could not pip install ${python_deps[*]} — install them manually"
+# 2. Dependencies: mpv (audio), aiohttp (scraper), jeepney (MPRIS media-tab integration)
+apt_deps=()
+command -v mpv >/dev/null 2>&1 || apt_deps+=("mpv")
+python3 -c "import aiohttp" 2>/dev/null || apt_deps+=("python3-aiohttp")
+python3 -c "import jeepney" 2>/dev/null || apt_deps+=("python3-jeepney")
+if [ ${#apt_deps[@]} -gt 0 ]; then
+    if command -v apt >/dev/null 2>&1; then
+        echo "==> Installing dependencies: ${apt_deps[*]}"
+        sudo apt install -y "${apt_deps[@]}"
+    else
+        echo "WARNING: missing ${apt_deps[*]} — install mpv, aiohttp and jeepney with your package manager"
+    fi
 fi
 
-# 3. mpv (audio playback)
-if ! command -v mpv >/dev/null 2>&1; then
-    echo "WARNING: mpv not found. Install it, e.g.:  sudo apt install mpv"
-fi
-
-# 4. Enable the plugin in DMS (rescan so DMS discovers it, then enable)
+# 3. Enable the plugin in DMS (rescan so DMS discovers it, then enable)
 if command -v dms >/dev/null 2>&1; then
     dms ipc call plugin-scan rescan "$PLUGIN_ID" >/dev/null 2>&1 || true
     if dms ipc call plugins enable "$PLUGIN_ID" >/dev/null 2>&1; then
